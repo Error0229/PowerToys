@@ -273,15 +273,18 @@
   <data name="builtin_settings_appearance_pick_background_image_title" xml:space="preserve">
     <value>Pick background image</value>
   </data>
+  <data name="builtin_settings_appearance_pick_background_folder_title" xml:space="preserve">
+    <value>Pick slideshow folder</value>
+  </data>
   <data name="fallbacks" xml:space="preserve">
     <value>Fallbacks</value>
   </data>
   <data name="dock_edit_dock_name" xml:space="preserve">
-    <value>Edit dock</value>
+    <value>Edit Dock</value>
     <comment>Command name for editing the dock</comment>
   </data>
   <data name="dock_settings_name" xml:space="preserve">
-    <value>Dock settings</value>
+    <value>Settings</value>
     <comment>Command name for opening dock settings</comment>
   </data>
   <data name="ShowDetailsCommand" xml:space="preserve">

@@ -27,7 +27,8 @@ internal sealed partial class ThemeService : IThemeService, IDisposable
     private static readonly TimeSpan ReloadDebounceInterval = TimeSpan.FromMilliseconds(500);
 
     private readonly UISettings _uiSettings;
-    private readonly SettingsModel _settings;
+    private readonly ISettingsService _settingsService;
+
     private readonly ResourceSwapper _resourceSwapper;
     private readonly NormalThemeProvider _normalThemeProvider;
     private readonly ColorfulThemeProvider _colorfulThemeProvider;
@@ -36,8 +37,15 @@ internal sealed partial class ThemeService : IThemeService, IDisposable
     private DispatcherQueueTimer? _dispatcherQueueTimer;
     private bool _isInitialized;
     private bool _disposed;
+    private int _rotateMainBackgroundOnActivation;
     private InternalThemeState _currentState;
     private DockThemeSnapshot _currentDockState;
+    private string? _mainBackgroundFolderPath;
+    private string? _mainBackgroundImagePath;
+    private DateTimeOffset _mainBackgroundChangedAtUtc;
+    private int _mainBackgroundSequentialIndex = -1;
+    private int[]? _shuffledOrder;
+    private int _shuffleCursor;
 
     public event EventHandler<ThemeChangedEventArgs>? ThemeChanged;
 
@@ -68,6 +76,17 @@ internal sealed partial class ThemeService : IThemeService, IDisposable
         Reload();
     }
 
+    public void RefreshThemeForActivation()
+    {
+        if (!_isInitialized || _settingsService.Settings.ColorizationMode != ColorizationMode.Slideshow)
+        {
+            return;
+        }
+
+        Interlocked.Exchange(ref _rotateMainBackgroundOnActivation, 1);
+        Reload();
+    }
+
     private void Reload()
     {
         if (!_isInitialized)
@@ -75,33 +94,36 @@ internal sealed partial class ThemeService : IThemeService, IDisposable
             return;
         }
 
+        var rotateMainBackgroundOnActivation = Interlocked.Exchange(ref _rotateMainBackgroundOnActivation, 0) == 1;
+
         // provider selection
-        var themeColorIntensity = Math.Clamp(_settings.CustomThemeColorIntensity, 0, 100);
-        var imageTintIntensity = Math.Clamp(_settings.BackgroundImageTintIntensity, 0, 100);
-        var effectiveColorIntensity = _settings.ColorizationMode == ColorizationMode.Image
+        var themeColorIntensity = Math.Clamp(_settingsService.Settings.CustomThemeColorIntensity, 0, 100);
+        var imageTintIntensity = Math.Clamp(_settingsService.Settings.BackgroundImageTintIntensity, 0, 100);
+        var effectiveColorIntensity = _settingsService.Settings.ColorizationMode is ColorizationMode.Image or ColorizationMode.Slideshow
             ? imageTintIntensity
             : themeColorIntensity;
 
         IThemeProvider provider = UseColorfulProvider(effectiveColorIntensity) ? _colorfulThemeProvider : _normalThemeProvider;
 
         // Calculate values
-        var tint = _settings.ColorizationMode switch
+        var tint = _settingsService.Settings.ColorizationMode switch
         {
-            ColorizationMode.CustomColor => _settings.CustomThemeColor,
+            ColorizationMode.CustomColor => _settingsService.Settings.CustomThemeColor,
             ColorizationMode.WindowsAccentColor => _uiSettings.GetColorValue(UIColorType.Accent),
-            ColorizationMode.Image => _settings.CustomThemeColor,
+            ColorizationMode.Image => _settingsService.Settings.CustomThemeColor,
+            ColorizationMode.Slideshow => _settingsService.Settings.CustomThemeColor,
             _ => Colors.Transparent,
         };
-        var effectiveTheme = GetElementTheme((ElementTheme)_settings.Theme);
-        var imageSource = _settings.ColorizationMode == ColorizationMode.Image
-            ? LoadImageSafe(_settings.BackgroundImagePath)
+        var effectiveTheme = GetElementTheme((ElementTheme)_settingsService.Settings.Theme);
+        var imageSource = _settingsService.Settings.ColorizationMode is ColorizationMode.Image or ColorizationMode.Slideshow
+            ? LoadImageSafe(ResolveMainBackgroundImagePath(rotateMainBackgroundOnActivation))
             : null;
-        var stretch = _settings.BackgroundImageFit switch
+        var stretch = _settingsService.Settings.BackgroundImageFit switch
         {
             BackgroundImageFit.Fill => Stretch.Fill,
             _ => Stretch.UniformToFill,
         };
-        var opacity = Math.Clamp(_settings.BackgroundImageOpacity, 0, 100) / 100.0;
+        var opacity = Math.Clamp(_settingsService.Settings.BackgroundImageOpacity, 0, 100) / 100.0;
 
         // create input and offload to actual theme provider
         var context = new ThemeContext
@@ -112,16 +134,16 @@ internal sealed partial class ThemeService : IThemeService, IDisposable
             BackgroundImageSource = imageSource,
             BackgroundImageStretch = stretch,
             BackgroundImageOpacity = opacity,
-            BackdropStyle = _settings.BackdropStyle,
-            BackdropOpacity = Math.Clamp(_settings.BackdropOpacity, 0, 100) / 100f,
+            BackdropStyle = _settingsService.Settings.BackdropStyle,
+            BackdropOpacity = Math.Clamp(_settingsService.Settings.BackdropOpacity, 0, 100) / 100f,
         };
         var backdrop = provider.GetBackdropParameters(context);
-        var blur = _settings.BackgroundImageBlurAmount;
-        var brightness = _settings.BackgroundImageBrightness;
+        var blur = _settingsService.Settings.BackgroundImageBlurAmount;
+        var brightness = _settingsService.Settings.BackgroundImageBrightness;
 
         // Create public snapshot (no provider!)
         var hasColorization = effectiveColorIntensity > 0
-            && _settings.ColorizationMode is ColorizationMode.CustomColor or ColorizationMode.WindowsAccentColor or ColorizationMode.Image;
+            && _settingsService.Settings.ColorizationMode is ColorizationMode.CustomColor or ColorizationMode.WindowsAccentColor or ColorizationMode.Image or ColorizationMode.Slideshow;
 
         var snapshot = new ThemeSnapshot
         {
@@ -149,7 +171,7 @@ internal sealed partial class ThemeService : IThemeService, IDisposable
         Interlocked.Exchange(ref _currentState, newState);
 
         // Compute DockThemeSnapshot from DockSettings
-        var dockSettings = _settings.DockSettings;
+        var dockSettings = _settingsService.Settings.DockSettings;
         var dockIntensity = Math.Clamp(dockSettings.CustomThemeColorIntensity, 0, 100);
         IThemeProvider dockProvider = dockIntensity > 0 && dockSettings.ColorizationMode is ColorizationMode.CustomColor or ColorizationMode.WindowsAccentColor or ColorizationMode.Image
                 ? _colorfulThemeProvider
@@ -164,7 +186,7 @@ internal sealed partial class ThemeService : IThemeService, IDisposable
         };
         var dockEffectiveTheme = GetElementTheme((ElementTheme)dockSettings.Theme);
         var dockImageSource = dockSettings.ColorizationMode == ColorizationMode.Image
-            ? LoadImageSafe(dockSettings.BackgroundImagePath)
+            ? LoadImageSafe(BackgroundImagePathResolver.ResolvePreviewImagePath(dockSettings.BackgroundImagePath))
             : null;
         var dockStretch = dockSettings.BackgroundImageFit switch
         {
@@ -208,8 +230,132 @@ internal sealed partial class ThemeService : IThemeService, IDisposable
 
     private bool UseColorfulProvider(int effectiveColorIntensity)
     {
-        return _settings.ColorizationMode == ColorizationMode.Image
-               || (effectiveColorIntensity > 0 && _settings.ColorizationMode is ColorizationMode.CustomColor or ColorizationMode.WindowsAccentColor);
+        return _settingsService.Settings.ColorizationMode == ColorizationMode.Image
+               || _settingsService.Settings.ColorizationMode == ColorizationMode.Slideshow
+               || (effectiveColorIntensity > 0 && _settingsService.Settings.ColorizationMode is ColorizationMode.CustomColor or ColorizationMode.WindowsAccentColor);
+    }
+
+    private static string? NormalizeConfiguredPath(string? configuredPath)
+        => string.IsNullOrWhiteSpace(configuredPath) ? null : configuredPath.Trim();
+
+    private string? ResolveMainBackgroundImagePath(bool rotateOnActivation)
+    {
+        if (_settingsService.Settings.ColorizationMode != ColorizationMode.Slideshow)
+        {
+            ResetMainBackgroundImageState();
+
+            var configuredImagePath = NormalizeConfiguredPath(_settingsService.Settings.BackgroundImagePath);
+            if (BackgroundImagePathResolver.TryGetLocalFolderPath(configuredImagePath, out _))
+            {
+                return BackgroundImagePathResolver.ResolvePreviewImagePath(configuredImagePath);
+            }
+
+            return configuredImagePath;
+        }
+
+        if (!BackgroundImagePathResolver.TryGetLocalFolderPath(NormalizeConfiguredPath(_settingsService.Settings.BackgroundImageSlideshowFolderPath), out var folderPath))
+        {
+            ResetMainBackgroundImageState();
+            return null;
+        }
+
+        var files = BackgroundImagePathResolver.GetSupportedImageFiles(folderPath);
+        if (files.Count == 0)
+        {
+            ResetMainBackgroundImageState();
+            return null;
+        }
+
+        var folderChanged = !string.Equals(_mainBackgroundFolderPath, folderPath, StringComparison.OrdinalIgnoreCase);
+        var hasSelection = !string.IsNullOrWhiteSpace(_mainBackgroundImagePath);
+        var selectedPath = _mainBackgroundImagePath ?? string.Empty;
+        var selectedImageStillValid =
+            hasSelection
+            && File.Exists(selectedPath)
+            && files.Any(path => string.Equals(path, selectedPath, StringComparison.OrdinalIgnoreCase));
+
+        var intervalMinutes = Math.Max(_settingsService.Settings.BackgroundImageChangeIntervalMinutes, 0);
+        var intervalElapsed = intervalMinutes == 0
+            || (DateTimeOffset.UtcNow - _mainBackgroundChangedAtUtc) >= TimeSpan.FromMinutes(intervalMinutes);
+
+        var shouldRotate =
+            folderChanged
+            || !selectedImageStillValid
+            || (rotateOnActivation && intervalElapsed);
+
+        if (!shouldRotate && selectedImageStillValid)
+        {
+            return _mainBackgroundImagePath;
+        }
+
+        var nextIndex = GetNextMainBackgroundImageIndex(files.Count, folderChanged, _settingsService.Settings.BackgroundImageShuffle);
+        _mainBackgroundFolderPath = folderPath;
+        _mainBackgroundSequentialIndex = nextIndex;
+        _mainBackgroundImagePath = files[nextIndex];
+        _mainBackgroundChangedAtUtc = DateTimeOffset.UtcNow;
+        return _mainBackgroundImagePath;
+    }
+
+    private int GetNextMainBackgroundImageIndex(int fileCount, bool folderChanged, bool shuffle)
+    {
+        if (fileCount <= 1)
+        {
+            return 0;
+        }
+
+        if (shuffle)
+        {
+            if (folderChanged || _shuffledOrder is null || _shuffledOrder.Length != fileCount || _shuffleCursor >= _shuffledOrder.Length)
+            {
+                _shuffledOrder = FisherYatesShuffle(fileCount);
+                _shuffleCursor = 0;
+
+                // Avoid repeating the last image at the start of a new deck.
+                if (!folderChanged
+                    && _shuffledOrder.Length > 1
+                    && _mainBackgroundSequentialIndex >= 0
+                    && _shuffledOrder[0] == _mainBackgroundSequentialIndex)
+                {
+                    (_shuffledOrder[0], _shuffledOrder[^1]) = (_shuffledOrder[^1], _shuffledOrder[0]);
+                }
+            }
+
+            return _shuffledOrder[_shuffleCursor++];
+        }
+
+        if (folderChanged || _mainBackgroundSequentialIndex < 0 || _mainBackgroundSequentialIndex >= fileCount)
+        {
+            return 0;
+        }
+
+        return (_mainBackgroundSequentialIndex + 1) % fileCount;
+    }
+
+    private static int[] FisherYatesShuffle(int count)
+    {
+        var indices = new int[count];
+        for (var i = 0; i < count; i++)
+        {
+            indices[i] = i;
+        }
+
+        for (var i = count - 1; i > 0; i--)
+        {
+            var j = Random.Shared.Next(i + 1);
+            (indices[i], indices[j]) = (indices[j], indices[i]);
+        }
+
+        return indices;
+    }
+
+    private void ResetMainBackgroundImageState()
+    {
+        _mainBackgroundFolderPath = null;
+        _mainBackgroundImagePath = null;
+        _mainBackgroundChangedAtUtc = default;
+        _mainBackgroundSequentialIndex = -1;
+        _shuffledOrder = null;
+        _shuffleCursor = 0;
     }
 
     private static BitmapImage? LoadImageSafe(string? path)
@@ -241,13 +387,12 @@ internal sealed partial class ThemeService : IThemeService, IDisposable
         }
     }
 
-    public ThemeService(SettingsModel settings, ResourceSwapper resourceSwapper)
+    public ThemeService(ResourceSwapper resourceSwapper, ISettingsService settingsService)
     {
-        ArgumentNullException.ThrowIfNull(settings);
         ArgumentNullException.ThrowIfNull(resourceSwapper);
 
-        _settings = settings;
-        _settings.SettingsChanged += SettingsOnSettingsChanged;
+        _settingsService = settingsService;
+        _settingsService.SettingsChanged += SettingsOnSettingsChanged;
 
         _resourceSwapper = resourceSwapper;
 
@@ -319,7 +464,7 @@ internal sealed partial class ThemeService : IThemeService, IDisposable
         };
     }
 
-    private void SettingsOnSettingsChanged(SettingsModel sender, object? args)
+    private void SettingsOnSettingsChanged(ISettingsService sender, SettingsModel args)
     {
         RequestReload();
     }
@@ -339,7 +484,7 @@ internal sealed partial class ThemeService : IThemeService, IDisposable
         _disposed = true;
         _dispatcherQueueTimer?.Stop();
         _uiSettings.ColorValuesChanged -= UiSettings_ColorValuesChanged;
-        _settings.SettingsChanged -= SettingsOnSettingsChanged;
+        _settingsService.SettingsChanged -= SettingsOnSettingsChanged;
     }
 
     private sealed class InternalThemeState
